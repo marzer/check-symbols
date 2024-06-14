@@ -33,9 +33,29 @@ def re_sub_all(pattern, repl, string, count=0, flags=0) -> str:
     return string
 
 
+STD_DEMANGLED = []
+for prefix, type in (('', 'char'), ('w', 'wchar_t'), ('u8', 'char8_t'), ('u16', 'char16_t'), ('u32', 'char32_t')):
+    STD_DEMANGLED.append(
+        (re.compile(rf'<\s*{type}\s*,\s*std::char_traits<{type}>\s*,\s*std::allocator<{type}>\s*>'), rf'<{type}>')
+    )
+    STD_DEMANGLED.append((re.compile(rf'<\s*{type}\s*,\s*std::char_traits<{type}>\s*>'), rf'<{type}>'))
+    STD_DEMANGLED.append(
+        (re.compile(rf'std::basic_(i|o)?string(stream|buf)?<\s*{type}\s*>'), rf'std::{prefix}\1string\2')
+    )
+for prefix, type in (('', 'char'), ('w', 'wchar_t')):
+    STD_DEMANGLED.append(
+        (re.compile(rf'std::basic_((?:if|of|f)?stream|(?:file|stream)buf|ios)<\s*{type}\s*>'), rf'std::{prefix}\1')
+    )
+
+
 def make_symbol_list(s, undefined_only=False):
-    # remove c++11 abi tags since that's our minimum
-    s = str(s).replace('[abi:cxx11]', '').strip()
+    # remove c++11 abi tags
+    s = str(s).replace('[abi:cxx11]', '').replace('std::__cxx11::', 'std::').strip()
+    # demangle std templated symbol names with their aliases
+    for expr, sub in STD_DEMANGLED:
+        s = expr.sub(sub, s)
+    # normalize whitespace
+    s = re_sub_all(r'[ \t][ \t]+', ' ', s)
     # split and trim per-line
     s = [i.strip() for i in re.split(r'[\r\n]', s)]
     # remove comments
@@ -52,13 +72,14 @@ def make_symbol_list(s, undefined_only=False):
         s2.append(i)
     s = s2
     # normalize spacing and weird oddities
+    s = [re_sub_all(r'^(.+?)@\s*[a-zA-Z][a-zA-Z0-9._]*\s*$', r'\1', i) for i in s]  # @IMPORT tags
     s = [re_sub_all(r'>\s+>', '>>', i) for i in s]
     s = [re_sub_all(r',\s\s+([a-zA-Z0-9_])', r', \1', i) for i in s]
     s = [re_sub_all(r'([a-zA-Z0-9_>])\s+\(', r'\1(', i) for i in s]
     # normalize vtable and type info representations
-    s = [re.sub(r'^\s*(.+?)\s*::\s*\$\s*(vtable|typeinfo)\s*$', r'\1::$\2', i).strip() for i in s]
-    s = [re.sub(r'^\s*\[\s*(vtable|typeinfo)\s*\]\s*(.+?)$', r'\2::$\1', i).strip() for i in s]
-    s = [re.sub(r'^\s*(vtable|typeinfo)\s+(?:for\s+)?(.+?)$', r'\2::$\1', i).strip() for i in s]
+    s = [re.sub(r'^\s*(.+?)\s*::\s*\$\s*(vtable|typeinfo|VTT)\s*$', r'\1::$\2', i).strip() for i in s]
+    s = [re.sub(r'^\s*\[\s*(vtable|typeinfo|VTT)\s*\]\s*(.+?)$', r'\2::$\1', i).strip() for i in s]
+    s = [re.sub(r'^\s*(vtable|typeinfo|VTT)\s+(?:for\s+)?(.+?)$', r'\2::$\1', i).strip() for i in s]
     # special handling for functions
     s2 = []
     for i in s:
@@ -104,6 +125,8 @@ def make_symbol_list(s, undefined_only=False):
                         i = i[pos:].strip()
                         break
 
+                i = re_sub_all(r'^\s*(?:const|volatile|const\s+volatile|volatile\s+const)\s*&\s+(.+?)\s*$', r'\1', i)
+
         s2.append(i)
     s = s2
     # remove blank lines
@@ -125,12 +148,19 @@ def get_relative_path(p: Path, relative_to: Path = Path.cwd()) -> Path:
         return p
 
 
+def matches_all(s: str, pattern) -> bool:
+    if pattern:
+        for p in pattern:
+            if not p.search(s):
+                return False
+    return True
+
+
 def matches_any(s: str, pattern) -> bool:
-    if not pattern:
-        return True
-    for p in pattern:
-        if p.search(s):
-            return True
+    if pattern:
+        for p in pattern:
+            if p.search(s):
+                return True
     return False
 
 
@@ -154,25 +184,30 @@ def main_impl():
         type=Path,
         default=None,
         metavar=r"<path>",
-        help=rf"text file containing a list of expected symbols to check (one per line)",
+        help='path to a text file containing a list of expected symbols (one per line). use a dash (\'-\') to read from stdin.',
     )
     args.add_argument(
         r"--diff",
         type=Path,
         default=None,
         metavar=r"<path>",
-        help=rf"compiled executable expected to consume the symbols",
+        help=rf"compiled executable or shared library expected to consume the symbols",
     )
     args.add_argument(
-        r"--pattern",
+        r"--include",
         type=str,
         nargs='+',
         metavar=r"<regex>",
         help=rf"one or more regular expressions to select the listed/checked symbols.",
     )
-    args.add_argument(r"--limit", type=int, default=0, help=rf"maximum number of symbols to list.")
+    args.add_argument(
+        r"--exclude",
+        type=str,
+        nargs='+',
+        metavar=r"<regex>",
+        help=rf"one or more regular expressions to exclude from the listed/checked symbols.",
+    )
     args = args.parse_args()
-    args.limit = max(int(args.limit), 0)
 
     if args.print_version:
         print(VERSION_STRING)
@@ -199,9 +234,12 @@ def main_impl():
             return rf"shared library {bright(args.lib)} did not exist or was not a file"
 
     # compute patterns
-    if not args.pattern:
-        args.pattern = []
-    args.pattern = [re.compile(s) for s in args.pattern]
+    if not args.include:
+        args.include = []
+    if not args.exclude:
+        args.exclude = []
+    args.include = [re.compile(s) for s in args.include]
+    args.exclude = [re.compile(s) for s in args.exclude]
 
     def get_filtered_symbols_from_binary(bin_path, undefined_only=False):
         nonlocal args
@@ -218,7 +256,8 @@ def main_impl():
                 outputs += "\n".join([rf'    {i.strip()}' for i in symbols.stderr.split('\n') if i.strip()])
             return (False, rf"{bright('nm')} exited with code {bright(symbols.returncode)}{outputs}")
         symbols = make_symbol_list(symbols.stdout, undefined_only=undefined_only)
-        symbols = [s for s in symbols if matches_any(s, args.pattern)]
+        symbols = [s for s in symbols if matches_all(s, args.include)]
+        symbols = [s for s in symbols if not matches_any(s, args.exclude)]
         symbols = sorted(misk.remove_duplicates(symbols))
         return (True, symbols)
 
@@ -229,26 +268,22 @@ def main_impl():
     symbols = symbols[1]
 
     # just list the symbols and exit if not in 'diff' or 'check' mode
-    list_num = 0
     if args.diff is None and args.check is None:
         for s in symbols:
             print(s)
-            list_num += 1
-            if args.limit and list_num >= args.limit:
-                break
         return 0
 
     retval = 0
 
-    # diff against executable
+    # diff against binary
     if args.diff is not None:
         if not (args.diff.exists() and args.diff.is_file()):
-            return rf"expected executable {bright(args.diff)} did not exist or was not a file"
+            return rf"expected binary {bright(args.diff)} did not exist or was not a file"
         exe_symbols = get_filtered_symbols_from_binary(args.diff, undefined_only=True)
         if not exe_symbols[0]:
             return exe_symbols[1]  # error message
         exe_symbols = exe_symbols[1]
-        print(rf'diffing symbols exported by {bright(args.lib)} against those expected by {bright(args.diff)}:')
+        print(rf'diffing symbols exported by {bright(args.lib)} against those imported by {bright(args.diff)}:')
         unused = []
         used = []
         missing = []
@@ -258,21 +293,15 @@ def main_impl():
             if symbol not in used:
                 missing.append(symbol)
         batches = (
-            (used, rf'symbols {bright("used", "GREEN")} by {bright(args.diff)}:', bright("OK", 'GREEN')),  #
-            (unused, rf'symbols {bright("unused", "YELLOW")} by {bright(args.diff)}:', bright("--", 'YELLOW')),
-            (missing, rf'symbols {bright("missing", "RED")} from {bright(args.lib)}:', bright("??", 'RED')),
+            (used, rf'exported symbols {bright("imported", "GREEN")} by {bright(args.diff)}:', bright("OK", 'GREEN')),
+            (unused, rf'exported symbols {bright("unused", "YELLOW")} by {bright(args.diff)}:', bright("--", 'YELLOW')),
+            (missing, rf'imported symbols {bright("not exported", "RED")} by {bright(args.lib)}:', bright("??", 'RED')),
         )
         for result, header, prefix in batches:
             if result:
-                list_num = 0
                 print(header)
                 for symbol in result:
                     print(rf'[{prefix}] {symbol}')
-                    list_num += 1
-                    if args.limit and list_num >= args.limit:
-                        break
-                if list_num < len(result):
-                    print(rf'... {len(result) - list_num} more')
         summary = r'exported '
         summary += bright(rf'{len(used)} / {len(used) + len(missing)}', 'GREEN' if not missing else 'RED')
         summary += rf' expected symbols'
@@ -285,30 +314,49 @@ def main_impl():
 
     # check against list file
     if args.check is not None:
-        if not (args.check.exists() and args.check.is_file()):
-            return rf"expected symbol list {bright(args.check)} did not exist or was not a file"
-        expected_symbols = make_symbol_list(misk.read_all_text_from_file(args.check))
-        expected_symbols = [s for s in expected_symbols if matches_any(s, args.pattern)]
+        check_text = ''
+        if args.check == Path('-'):
+            for line in sys.stdin:
+                check_text += f'{line.rstrip()}\n'
+        else:
+            if not (args.check.exists() and args.check.is_file()):
+                return rf"expected symbol list {bright(args.check)} did not exist or was not a file"
+            check_text = misk.read_all_text_from_file(args.check)
+        expected_symbols = make_symbol_list(check_text)
+        expected_symbols = [s for s in expected_symbols if matches_all(s, args.include)]
+        expected_symbols = [s for s in expected_symbols if not matches_any(s, args.exclude)]
         if not expected_symbols:
             return rf"expected symbol list {bright(args.check)} was empty"
         print(rf'checking symbols {bright(args.lib)} with those listed in {bright(args.check)}:')
-        printed_num = 0
         found_count = 0
         for symbol in expected_symbols:
             if symbol in symbols:
-                if not args.limit or printed_num < args.limit:
-                    print(rf'[{bright("OK", "GREEN")}] {symbol}')
-                    printed_num += 1
+                print(rf'[{bright("OK", "GREEN")}] {symbol}')
                 found_count += 1
             else:
-                if not args.limit or printed_num < args.limit:
-                    print(rf'[{bright("??", "RED")}] {symbol} - {bright("not found", "RED")}')
-                    printed_num += 1
-        if printed_num < len(expected_symbols):
-            print(rf'... {len(expected_symbols) - printed_num} more')
-        print(rf'found {bright(found_count)} / {bright(len(expected_symbols))} symbols')
+                print(rf'[{bright("??", "RED")}] {symbol} - {bright("not found", "RED")}')
+        unexpected_count = 0
+        for symbol in symbols:
+            if symbol not in expected_symbols:
+                if unexpected_count == 0:
+                    print(rf'exported symbols that were {bright("NOT", "RED")} on the list:')
+                print(rf'[{bright("XX", "RED")}] {symbol}')
+                unexpected_count += 1
+
+        summary = r'found '
+        summary += bright(
+            rf'{found_count} / {len(expected_symbols)}', 'GREEN' if (found_count == len(expected_symbols)) else 'RED'
+        )
+        summary += rf' expected symbols'
+        if unexpected_count:
+            summary += rf' and {bright(unexpected_count, "RED")} unexpected ones'
+        summary += rf'.'
+        print(summary)
+
         if found_count != len(expected_symbols):
-            retval = retval or 1
+            retval = retval | 1
+        if unexpected_count:
+            retval = retval | 2
 
     return retval
 
