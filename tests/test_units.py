@@ -114,12 +114,12 @@ def test_the_version_file_is_read_only_from_a_source_tree(tmp_path, packages, di
         ),
         pytest.param('D _edata\nB __bss_start\nB _end\nT _init\nT _fini', [], id='linker-symbols-dropped'),
         pytest.param(
-            'B bss\nD data\nR rodata\nT text\nV weak_object\nW weak_function\nu unique\ni indirect',
-            ['bss', 'data', 'indirect', 'rodata', 'text', 'unique', 'weak_function', 'weak_object'],
+            'B bss\nD data\nR rodata\nT text\ni indirect',
+            ['bss', 'data', 'indirect', 'rodata', 'text'],
             id='exported-categories-kept',
         ),
         pytest.param(
-            'U foo\nw bar\nv baz\nA FIXTURE_1.0\nN debug\nC common\nI alias\nb bss\nd data\nr rodata\nt text\n? unknown',
+            'U foo\nw bar\nv baz\nW weak_function\nV weak_object\nu unique\nA FIXTURE_1.0\nN debug\nC common\nI alias\nb bss\nd data\nr rodata\nt text\n? unknown',
             [],
             id='other-categories-dropped',
         ),
@@ -129,9 +129,16 @@ def test_make_symbol_list_normalises(text, expected):
     assert make_symbol_list(text) == expected
 
 
-def test_weak_definitions_are_kept_and_weak_imports_are_dropped():
-    text = '0000000000001130 W foo\n0000000000004010 V bar\n                 w baz\n                 v qux'
-    assert make_symbol_list(text) == ['bar', 'foo']
+def test_weak_symbols_are_dropped():
+    text = '0000000000001130 W foo\n0000000000004010 V bar\n0000000000004018 u quux\n                 w baz\n                 v qux'
+    assert make_symbol_list(text) == []
+    assert make_symbol_list(text, abi_symbols=True) == []
+
+
+def test_weak_abi_symbols_are_kept_only_with_the_flag():
+    text = '0000000000004d80 V vtable for Foo\n0000000000001130 W Foo::f()'
+    assert make_symbol_list(text) == []
+    assert make_symbol_list(text, abi_symbols=True) == ['Foo::$vtable']
 
 
 def test_undefined_only_keeps_imports_and_drops_exports():
@@ -216,15 +223,15 @@ def test_abi_symbols_normalise_to_dollar_names_with_the_flag(text, expected):
         ('B ns::VTT', 'ns::VTT'),
         ('T ns::guard_variable_for(int)', 'ns::guard_variable_for'),
         ('T ns::thunk::to(int)', 'ns::thunk::to'),
-        ('u ns::f()::x', 'ns::f()::x'),
-        ('W ns::f()::{lambda(int)#1}::operator()(int) const', 'ns::f()::{lambda(int)#1}::operator()'),
+        ('B ns::f()::x', 'ns::f()::x'),
+        ('T ns::f()::{lambda(int)#1}::operator()(int) const', 'ns::f()::{lambda(int)#1}::operator()'),
         ('T _ZGVbN2v_sin@@GLIBC_2.22', '_ZGVbN2v_sin'),
         ('T typeinfo ns::get<long>()', 'ns::get<long>'),
-        ('W vtable ns::make<int>()', 'ns::make<int>'),
-        ('W VTT ns::table<int>()', 'ns::table<int>'),
-        ('W typeinfo const& ns::ref<int>()', 'ns::ref<int>'),
-        ('W typeinfo name<int>()', 'name<int>'),
-        ('W typeinfo for_each<int>()', 'for_each<int>'),
+        ('T vtable ns::make<int>()', 'ns::make<int>'),
+        ('T VTT ns::table<int>()', 'ns::table<int>'),
+        ('T typeinfo const& ns::ref<int>()', 'ns::ref<int>'),
+        ('T typeinfo name<int>()', 'name<int>'),
+        ('T typeinfo for_each<int>()', 'for_each<int>'),
     ],
 )
 def test_user_declared_names_that_resemble_abi_symbols_are_kept(text, expected):

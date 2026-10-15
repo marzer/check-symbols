@@ -23,21 +23,16 @@ EXPORTED = [
     'fixture::counter',
     'fixture::dispatched',
     'fixture::doubler::operator()',
-    'fixture::fallback',
     'fixture::not_imported',
     'fixture::operator*',
     'fixture::seed',
-    'fixture::shape::shape',
     'fixture::shape::~shape',
-    'fixture::shared',
     'fixture::square::area',
     'fixture::square::operator bool',
     'fixture::square::operator delete',
     'fixture::square::operator new',
     'fixture::square::square',
-    'fixture::square::~square',
     'fixture::table',
-    'fixture::thrice<int>',
     'fixture::twice<int>',
     'versioned_answer',
 ]
@@ -52,6 +47,7 @@ ABI_SYMBOLS = [
 ]
 
 FIXTURE_ONLY = r'^(fixture::|versioned_answer$)'
+WEAK = r'thrice'
 
 
 def run(*args, stdin=None, cwd=None, env=None) -> subprocess.CompletedProcess:
@@ -197,30 +193,27 @@ def test_diff_reports_imported_unused_and_missing_symbols(library, consumer):
     assert '[OK] fixture::square::operator new' in stdout
     assert '[OK] fixture::square::operator delete' in stdout
     assert '[OK] fixture::doubler::operator()' in stdout
-    assert '[OK] fixture::thrice<int>' in stdout
     assert '[OK] fixture::dispatched' in stdout
     assert '[--] fixture::not_imported' in stdout
     assert '[--] fixture::table' in stdout
-    assert '[--] fixture::fallback' in stdout
+    assert '[??] fixture::thrice<int>' in stdout
     assert '[??] __libc_start_main' in stdout
 
 
 def test_diff_exits_zero_when_every_filtered_import_is_exported(library, consumer):
-    result = run(library, '--diff', consumer, '--include', FIXTURE_ONLY)
+    result = run(library, '--diff', consumer, '--include', FIXTURE_ONLY, '--exclude', WEAK)
     assert result.returncode == 0, result.stdout
     assert '[??]' not in result.stdout
     assert '[OK] fixture::twice<int>' in result.stdout
 
 
 def test_diff_does_not_count_unique_globals_defined_by_the_consumer_as_imports(library, consumer):
-    stdout = run(library, '--diff', consumer).stdout.splitlines()
-    assert '[--] fixture::shared' in stdout
-    assert '[??] fixture::shared' not in stdout
+    assert 'fixture::shared' not in run(library, '--diff', consumer).stdout
 
 
 def test_diff_lists_abi_symbols_only_with_abi_symbols(library, consumer):
     assert '::$' not in run(library, '--diff', consumer).stdout
-    result = run(library, '--diff', consumer, '--abi-symbols', '--include', FIXTURE_ONLY)
+    result = run(library, '--diff', consumer, '--abi-symbols', '--include', FIXTURE_ONLY, '--exclude', WEAK)
     assert result.returncode == 0, result.stdout
     stdout = result.stdout.splitlines()
     assert '[OK] fixture::shape::$typeinfo' in stdout

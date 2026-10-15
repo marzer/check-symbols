@@ -78,13 +78,14 @@ includes the forms that earlier versions printed, such as `X::$vtable`. To check
 
 Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, and are then normalised:
 
--   A library exports the symbols of type B and D (data), R (read-only data), T (code), V and W (weak definitions),
-    u (unique globals) and i (indirect functions). Types are matched case-sensitively. U, v and w are imports, and
-    only U counts on the consumer side of --diff. A, the version definitions, is dropped, as are linker-generated
-    symbols such as `_edata` and `__bss_start`.
+-   A library exports the symbols of type B and D (data), R (read-only data), T (code) and i (indirect functions).
+    Types are matched case-sensitively. Weak and unique definitions (V, W and u) are dropped: they are mostly
+    template instantiations and inline functions, and which of them appear depends on the toolchain. U, v and w are
+    imports, and only U counts on the consumer side of --diff. A, the version definitions, is dropped, as are
+    linker-generated symbols such as `_edata` and `__bss_start`.
 -   Compiler-generated ABI symbols are dropped: vtables, VTTs, typeinfo, thunks, guard variables, TLS init and
     wrapper functions, transaction clones, reference temporaries, template parameter objects and module
-    initialisers. Where these appear depends on LTO and the toolchain. --abi-symbols keeps them.
+    initialisers. Where these appear depends on LTO and the toolchain. --abi-symbols keeps them, weak or not.
 -   Version tags are removed: `adler32@@ZLIB_1.2.0` becomes `adler32`.
 -   Parameter lists and cv- and ref-qualifiers are removed, so all overloads of a function share one name:
     `ns::vec::get(int) const` becomes `ns::vec::get`.

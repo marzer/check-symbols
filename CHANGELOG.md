@@ -1,11 +1,15 @@
 # Changelog
 
+## v0.3.1 - 2026-10-15
+
+- fixed weak and unique definition (V, W and u) regression
+
 ## v0.3.0 - 2026-10-15
 
 - fixed `--diff` counting the consumer's own unique globals (u) as imports
 - fixed some function templates being listed as `X::$typeinfo`, `X::$vtable` or `X::$VTT`
 - ignored compiler-generated ABI symbols by default
-- added symbol types R, V, W, u and i
+- added symbol types R, and i
 - added `--abi-symbols`
 
 ## v0.2.0 - 2026-10-15

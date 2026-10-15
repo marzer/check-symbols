@@ -55,7 +55,8 @@ OPERATOR = re.compile(r'\boperator\b')
 NESTED = r'(?:[^()]|\([^()]*\))*'
 POINTER_DECLARATOR = re.compile(rf'\((?:{NESTED}::)?[*&]{NESTED}\)$')
 
-EXPORTED_CATEGORIES = (r'B', r'D', r'R', r'T', r'V', r'W', r'u', r'i')
+EXPORTED_CATEGORIES = (r'B', r'D', r'R', r'T', r'i')
+WEAK_CATEGORIES = (r'V', r'W', r'u')
 ABI_SYMBOL = re.compile(
     r'(?:(?:vtable|VTT|construction vtable|typeinfo|typeinfo name|typeinfo fn|guard variable|TLS init function'
     r'|TLS wrapper function|transaction clone|reference temporary #\d+|template parameter object) for'
@@ -134,13 +135,18 @@ def make_symbol_list(s, undefined_only=False, comments=False, abi_symbols=False)
         s = [remove_comment(i) for i in s]
     # remove any categorized symbols we don't want (https://linux.die.net/man/1/nm)
     allowed_categories = (r'U',) if undefined_only else EXPORTED_CATEGORIES
+    # weak and unique definitions are mostly template instantiations and inline functions and vary with the
+    # toolchain; the only ones worth listing are the vtables and typeinfo behind --abi-symbols
+    weak_abi_symbols = abi_symbols and not undefined_only
     s2 = []
     for i in s:
         m = re.match(r'^(?:[0-9a-fA-F]{6,32}\s+)?([a-zA-Z?])\s+(.+?)$', i)
         if m:
-            if m[1] not in allowed_categories:
+            category, i = m[1], m[2].strip()
+            if category not in allowed_categories and not (
+                weak_abi_symbols and category in WEAK_CATEGORIES and ABI_SYMBOL.match(i)
+            ):
                 continue
-            i = m[2].strip()
         if not abi_symbols and ABI_SYMBOL.match(i):
             continue
         s2.append(i)
