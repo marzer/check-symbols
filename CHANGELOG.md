@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 - 2026-10-15
+
+- fixed `--diff` counting the consumer's own unique globals (u) as imports
+- fixed some function templates being listed as `X::$typeinfo`, `X::$vtable` or `X::$VTT`
+- ignored compiler-generated ABI symbols by default
+- added symbol types R, V, W, u and i
+- added `--abi-symbols`
+
 ## v0.2.0 - 2026-10-15
 
 - fixed versioned symbols (`foo@@VER`) keeping a trailing `@`, which also stopped their parameter lists being removed

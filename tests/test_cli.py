@@ -21,18 +21,34 @@ pytestmark = pytest.mark.skipif(
 EXPORTED = [
     'fixture::add',
     'fixture::counter',
+    'fixture::dispatched',
     'fixture::doubler::operator()',
+    'fixture::fallback',
     'fixture::not_imported',
     'fixture::operator*',
     'fixture::seed',
+    'fixture::shape::shape',
     'fixture::shape::~shape',
+    'fixture::shared',
     'fixture::square::area',
     'fixture::square::operator bool',
     'fixture::square::operator delete',
     'fixture::square::operator new',
     'fixture::square::square',
+    'fixture::square::~square',
+    'fixture::table',
+    'fixture::thrice<int>',
     'fixture::twice<int>',
     'versioned_answer',
+]
+
+ABI_SYMBOLS = [
+    'fixture::shape::$typeinfo',
+    'fixture::shape::$typeinfo_name',
+    'fixture::shape::$vtable',
+    'fixture::square::$typeinfo',
+    'fixture::square::$typeinfo_name',
+    'fixture::square::$vtable',
 ]
 
 FIXTURE_ONLY = r'^(fixture::|versioned_answer$)'
@@ -49,10 +65,6 @@ def run(*args, stdin=None, cwd=None, env=None) -> subprocess.CompletedProcess:
         env=env,
         timeout=60,
     )
-
-
-def without_rtti(output: str) -> list[str]:
-    return [s for s in output.splitlines() if '::$' not in s]
 
 
 def assert_friendly_error(result: subprocess.CompletedProcess, message: str):
@@ -81,13 +93,40 @@ def test_version_matches_version_file():
 
 def test_list_mode_prints_sorted_normalised_symbols(symbol_list):
     assert symbol_list == sorted(set(symbol_list))
-    assert without_rtti('\n'.join(symbol_list)) == EXPORTED
+    assert symbol_list == EXPORTED
+
+
+def test_list_mode_adds_vtables_and_typeinfo_with_abi_symbols(library):
+    result = run(library, '--abi-symbols')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == sorted(EXPORTED + ABI_SYMBOLS)
 
 
 def test_list_mode_output_round_trips_through_check(library, symbol_list, tmp_path):
     result = run(library, '--check', write_list(tmp_path / 'symbols.txt', symbol_list))
     assert result.returncode == 0, result.stdout
     assert result.stdout.splitlines()[-1] == f'found {len(symbol_list)} / {len(symbol_list)} expected symbols.'
+
+
+def test_list_mode_output_round_trips_through_check_with_abi_symbols(library, tmp_path):
+    symbols = run(library, '--abi-symbols').stdout.splitlines()
+    result = run(library, '--abi-symbols', '--check', write_list(tmp_path / 'symbols.txt', symbols))
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.splitlines()[-1] == f'found {len(symbols)} / {len(symbols)} expected symbols.'
+
+
+def test_check_ignores_abi_symbols_in_an_old_check_file(library, symbol_list, tmp_path):
+    lines = [*symbol_list, *ABI_SYMBOLS, 'name for fixture::shape::$typeinfo']
+    result = run(library, '--check', write_list(tmp_path / 'symbols.txt', lines))
+    assert result.returncode == 0, result.stdout
+    assert '::$' not in result.stdout
+    assert result.stdout.splitlines()[-1] == f'found {len(symbol_list)} / {len(symbol_list)} expected symbols.'
+
+
+def test_check_with_abi_symbols_reports_vtables_missing_from_the_list(library, symbol_list, tmp_path):
+    result = run(library, '--abi-symbols', '--check', write_list(tmp_path / 'symbols.txt', symbol_list))
+    assert result.returncode == 2
+    assert '[XX] fixture::square::$vtable' in result.stdout.splitlines()
 
 
 def test_check_reads_the_list_from_stdin(library, symbol_list):
@@ -133,7 +172,7 @@ def test_check_file_stray_parenthesis_is_reported_missing_without_crashing(libra
 def test_include_patterns_must_all_match(library):
     result = run(library, '--include', r'^fixture::', r'operator')
     assert result.returncode == 0
-    assert without_rtti(result.stdout) == [s for s in EXPORTED if s.startswith('fixture::') and 'operator' in s]
+    assert result.stdout.splitlines() == [s for s in EXPORTED if s.startswith('fixture::') and 'operator' in s]
 
 
 def test_exclude_patterns_drop_any_match(library):
@@ -158,7 +197,11 @@ def test_diff_reports_imported_unused_and_missing_symbols(library, consumer):
     assert '[OK] fixture::square::operator new' in stdout
     assert '[OK] fixture::square::operator delete' in stdout
     assert '[OK] fixture::doubler::operator()' in stdout
+    assert '[OK] fixture::thrice<int>' in stdout
+    assert '[OK] fixture::dispatched' in stdout
     assert '[--] fixture::not_imported' in stdout
+    assert '[--] fixture::table' in stdout
+    assert '[--] fixture::fallback' in stdout
     assert '[??] __libc_start_main' in stdout
 
 
@@ -167,6 +210,21 @@ def test_diff_exits_zero_when_every_filtered_import_is_exported(library, consume
     assert result.returncode == 0, result.stdout
     assert '[??]' not in result.stdout
     assert '[OK] fixture::twice<int>' in result.stdout
+
+
+def test_diff_does_not_count_unique_globals_defined_by_the_consumer_as_imports(library, consumer):
+    stdout = run(library, '--diff', consumer).stdout.splitlines()
+    assert '[--] fixture::shared' in stdout
+    assert '[??] fixture::shared' not in stdout
+
+
+def test_diff_lists_abi_symbols_only_with_abi_symbols(library, consumer):
+    assert '::$' not in run(library, '--diff', consumer).stdout
+    result = run(library, '--diff', consumer, '--abi-symbols', '--include', FIXTURE_ONLY)
+    assert result.returncode == 0, result.stdout
+    stdout = result.stdout.splitlines()
+    assert '[OK] fixture::shape::$typeinfo' in stdout
+    assert '[--] fixture::square::$vtable' in stdout
 
 
 def test_diff_and_check_exit_bits_combine(library, consumer, symbol_list, tmp_path):

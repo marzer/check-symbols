@@ -55,6 +55,17 @@ OPERATOR = re.compile(r'\boperator\b')
 NESTED = r'(?:[^()]|\([^()]*\))*'
 POINTER_DECLARATOR = re.compile(rf'\((?:{NESTED}::)?[*&]{NESTED}\)$')
 
+EXPORTED_CATEGORIES = (r'B', r'D', r'R', r'T', r'V', r'W', r'u', r'i')
+ABI_SYMBOL = re.compile(
+    r'(?:(?:vtable|VTT|construction vtable|typeinfo|typeinfo name|typeinfo fn|guard variable|TLS init function'
+    r'|TLS wrapper function|transaction clone|reference temporary #\d+|template parameter object) for'
+    r'|(?:virtual|non-virtual|covariant return) thunk to|initializer for module)[ (]|_ZGR'
+)
+NORMALISED_ABI_SYMBOL = re.compile(
+    r'.+::\$(?:vtable|VTT|typeinfo|typeinfo_name)|reference temporary'
+    r'|(?:(?:return )?thunk to|(?:variable|clone|init function|wrapper function|parameter object) for)[ (].+'
+)
+
 
 def remove_comment(line: str) -> str:
     depth = 0
@@ -108,7 +119,7 @@ def strip_signature(name: str) -> str:
     return name
 
 
-def make_symbol_list(s, undefined_only=False, comments=False) -> list[str]:
+def make_symbol_list(s, undefined_only=False, comments=False, abi_symbols=False) -> list[str]:
     # remove c++11 abi tags
     s = str(s).replace('[abi:cxx11]', '').replace('std::__cxx11::', 'std::').strip()
     # demangle std templated symbol names with their aliases
@@ -122,14 +133,16 @@ def make_symbol_list(s, undefined_only=False, comments=False) -> list[str]:
     if comments:
         s = [remove_comment(i) for i in s]
     # remove any categorized symbols we don't want (https://linux.die.net/man/1/nm)
-    allowed_categories = (r'U',) if undefined_only else (r'B', r'D', r'T')
+    allowed_categories = (r'U',) if undefined_only else EXPORTED_CATEGORIES
     s2 = []
     for i in s:
-        m = re.match(r'^(?:[0-9a-fA-F]{6,32}\s+)?([a-zA-Z])\s+(.+?)$', i)
+        m = re.match(r'^(?:[0-9a-fA-F]{6,32}\s+)?([a-zA-Z?])\s+(.+?)$', i)
         if m:
-            if m[1].upper() not in allowed_categories:
+            if m[1] not in allowed_categories:
                 continue
             i = m[2].strip()
+        if not abi_symbols and ABI_SYMBOL.match(i):
+            continue
         s2.append(i)
     s = s2
     # normalize spacing and weird oddities
@@ -140,8 +153,11 @@ def make_symbol_list(s, undefined_only=False, comments=False) -> list[str]:
     # normalize vtable and type info representations
     s = [re.sub(r'^\s*(.+?)\s*::\s*\$\s*(vtable|typeinfo_name|typeinfo|VTT)\s*$', r'\1::$\2', i).strip() for i in s]
     s = [re.sub(r'^\s*\[\s*(vtable|typeinfo_name|typeinfo|VTT)\s*\]\s*(.+?)$', r'\2::$\1', i).strip() for i in s]
-    s = [re.sub(r'^\s*typeinfo\s+name\s+(?:for\s+)?(.+?)$', r'\1::$typeinfo_name', i).strip() for i in s]
-    s = [re.sub(r'^\s*(vtable|typeinfo|VTT)\s+(?:for\s+)?(.+?)$', r'\2::$\1', i).strip() for i in s]
+    if abi_symbols:
+        s = [re.sub(r'^\s*typeinfo\s+name\s+(?:for\s+)?(.+?)$', r'\1::$typeinfo_name', i).strip() for i in s]
+        s = [re.sub(r'^\s*(vtable|typeinfo|VTT)\s+(?:for\s+)?(.+?)$', r'\2::$\1', i).strip() for i in s]
+    elif comments:
+        s = [i for i in s if not NORMALISED_ABI_SYMBOL.fullmatch(i)]
     # special handling for functions
     s = [strip_signature(i) for i in s]
     # remove blank lines
@@ -232,6 +248,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         metavar=r"<regex>",
         help=rf"one or more regular expressions to exclude from the listed/checked symbols.",
     )
+    parser.add_argument(
+        r"--abi-symbols",
+        action=r'store_true',
+        help=r"include compiler-generated ABI symbols such as vtables, typeinfo, thunks and guard variables",
+    )
     return parser.parse_args(argv)
 
 
@@ -255,13 +276,13 @@ def compile_patterns(patterns: typing.Optional[list[str]]) -> list[re.Pattern]:
         raise Error(rf"invalid regular expression {bright(err.pattern)}: {err}") from None
 
 
-def run_nm(path: Path, undefined_only=False) -> list[str]:
+def run_nm(path: Path, undefined_only=False, abi_symbols=False) -> list[str]:
     try:
         result = subprocess.run([r'nm', r'-PBDCg', str(path)], capture_output=True, encoding='utf-8')
     except FileNotFoundError:
         raise Error(rf"{bright('nm')} was not found on the PATH") from None
     if result.returncode == 0:
-        return make_symbol_list(result.stdout, undefined_only=undefined_only)
+        return make_symbol_list(result.stdout, undefined_only=undefined_only, abi_symbols=abi_symbols)
     outputs = ''
     for name, text in (('stdout', result.stdout), ('stderr', result.stderr)):
         if text:
@@ -335,7 +356,7 @@ def main_impl(argv=None) -> int:
     lib = find_library(args.lib)
     include = compile_patterns(args.include)
     exclude = compile_patterns(args.exclude)
-    exported = filter_symbols(run_nm(lib), include, exclude)
+    exported = filter_symbols(run_nm(lib, abi_symbols=args.abi_symbols), include, exclude)
 
     if args.diff is None and args.check is None:
         for symbol in exported:
@@ -347,14 +368,16 @@ def main_impl(argv=None) -> int:
     if args.diff is not None:
         if not args.diff.is_file():
             raise Error(rf"expected binary {bright(args.diff)} did not exist or was not a file")
-        imported = filter_symbols(run_nm(args.diff, undefined_only=True), include, exclude)
+        imported = run_nm(args.diff, undefined_only=True, abi_symbols=args.abi_symbols)
+        imported = filter_symbols(imported, include, exclude)
         used, unused, missing = diff_symbols(exported, imported)
         print_diff(lib, args.diff, used, unused, missing)
         if missing:
             result |= 1
 
     if args.check is not None:
-        expected = filter_symbols(make_symbol_list(read_check_file(args.check), comments=True), include, exclude)
+        expected = make_symbol_list(read_check_file(args.check), comments=True, abi_symbols=args.abi_symbols)
+        expected = filter_symbols(expected, include, exclude)
         if not expected:
             raise Error(rf"expected symbol list {bright(args.check)} was empty")
         missing, unexpected = check_symbols(exported, expected)

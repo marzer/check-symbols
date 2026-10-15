@@ -38,10 +38,19 @@ namespace fixture
 	template <>
 	int twice<int>(int value) noexcept;
 
+	template <typename T>
+	T thrice(T value) noexcept;
+
 	int not_imported() noexcept;
+
+	int dispatched() noexcept;
 
 	extern int counter;
 	extern int seed;
+	extern int fallback;
+	extern const int table[4];
+
+	inline int shared = 5;
 }
 
 extern "C" int versioned_answer() noexcept;

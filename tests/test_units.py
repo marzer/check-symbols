@@ -112,16 +112,16 @@ def test_the_version_file_is_read_only_from_a_source_tree(tmp_path, packages, di
             ['std::ifstream::close'],
             id='std-ifstream-aliased',
         ),
-        pytest.param('D vtable for Foo', ['Foo::$vtable'], id='vtable'),
-        pytest.param('D typeinfo for Foo', ['Foo::$typeinfo'], id='typeinfo'),
-        pytest.param('D VTT for Foo', ['Foo::$VTT'], id='vtt'),
-        pytest.param('Foo :: $vtable', ['Foo::$vtable'], id='spaced-dollar-form'),
-        pytest.param('[typeinfo] Foo', ['Foo::$typeinfo'], id='bracketed-form'),
         pytest.param('D _edata\nB __bss_start\nB _end\nT _init\nT _fini', [], id='linker-symbols-dropped'),
         pytest.param(
-            'U foo\nW bar\nw baz\nV qux\nv quux\nR corge\nu garply\ni waldo\nA FIXTURE_1.0',
+            'B bss\nD data\nR rodata\nT text\nV weak_object\nW weak_function\nu unique\ni indirect',
+            ['bss', 'data', 'indirect', 'rodata', 'text', 'unique', 'weak_function', 'weak_object'],
+            id='exported-categories-kept',
+        ),
+        pytest.param(
+            'U foo\nw bar\nv baz\nA FIXTURE_1.0\nN debug\nC common\nI alias\nb bss\nd data\nr rodata\nt text\n? unknown',
             [],
-            id='categories-other-than-bdt-dropped',
+            id='other-categories-dropped',
         ),
     ],
 )
@@ -129,9 +129,216 @@ def test_make_symbol_list_normalises(text, expected):
     assert make_symbol_list(text) == expected
 
 
+def test_weak_definitions_are_kept_and_weak_imports_are_dropped():
+    text = '0000000000001130 W foo\n0000000000004010 V bar\n                 w baz\n                 v qux'
+    assert make_symbol_list(text) == ['bar', 'foo']
+
+
 def test_undefined_only_keeps_imports_and_drops_exports():
     text = '                 U close@GLIBC_2.2.5\n0000000000001130 T foo'
     assert make_symbol_list(text, undefined_only=True) == ['close']
+
+
+@pytest.mark.parametrize('category', list('ABCDGINRSTUVWbdinprstuvw?'))
+def test_undefined_only_keeps_only_u(category):
+    expected = ['foo'] if category == 'U' else []
+    assert make_symbol_list(f'0000000000001130 {category} foo', undefined_only=True) == expected
+
+
+ABI_SYMBOLS = [
+    pytest.param('V', 'vtable for ns::Foo', 'ns::Foo::$vtable', id='vtable'),
+    pytest.param('V', 'VTT for ns::Foo', 'ns::Foo::$VTT', id='vtt'),
+    pytest.param(
+        'V',
+        'construction vtable for ns::Base-in-ns::Foo',
+        'construction vtable for ns::Base-in-ns::Foo',
+        id='construction-vtable',
+    ),
+    pytest.param('V', 'typeinfo for ns::Foo', 'ns::Foo::$typeinfo', id='typeinfo'),
+    pytest.param('V', 'typeinfo name for ns::Foo', 'ns::Foo::$typeinfo_name', id='typeinfo-name'),
+    pytest.param('D', 'typeinfo fn for ns::Foo', 'fn for ns::Foo::$typeinfo', id='typeinfo-fn'),
+    pytest.param('u', 'guard variable for ns::f()::x', 'guard variable for ns::f()::x', id='guard-variable'),
+    pytest.param('T', 'TLS init function for ns::x', 'TLS init function for ns::x', id='tls-init-function'),
+    pytest.param('W', 'TLS wrapper function for ns::x', 'TLS wrapper function for ns::x', id='tls-wrapper-function'),
+    pytest.param('W', 'virtual thunk to ns::Foo::~Foo()', 'thunk to ns::Foo::~Foo', id='virtual-thunk'),
+    pytest.param('T', 'non-virtual thunk to ns::Foo::g(int)', 'thunk to ns::Foo::g', id='non-virtual-thunk'),
+    pytest.param(
+        'T', 'covariant return thunk to ns::Foo::clone() const', 'return thunk to ns::Foo::clone', id='covariant-thunk'
+    ),
+    pytest.param('T', 'transaction clone for ns::f(int)', 'clone for ns::f', id='transaction-clone'),
+    pytest.param('B', 'reference temporary #0 for ns::r', 'reference temporary #0 for ns::r', id='reference-temporary'),
+    pytest.param('R', '_ZGRN2ns1rE_', '_ZGRN2ns1rE_', id='undemangled-reference-temporary'),
+    pytest.param(
+        'V',
+        'template parameter object for ns::point{3}',
+        'template parameter object for ns::point{3}',
+        id='template-parameter-object',
+    ),
+    pytest.param('T', 'initializer for module ns.mod', 'initializer for module ns.mod', id='module-initialiser'),
+]
+
+
+@pytest.mark.parametrize('category,name,normalised', ABI_SYMBOLS)
+def test_abi_symbols_are_dropped_by_default(category, name, normalised):
+    assert make_symbol_list(f'0000000000001130 {category} {name}') == []
+    assert make_symbol_list(f'0000000000001130 {category} {name}@@LIB_1.0') == []
+    assert make_symbol_list(f'                 U {name}', undefined_only=True) == []
+    assert make_symbol_list(name, comments=True) == []
+
+
+@pytest.mark.parametrize('category,name,normalised', ABI_SYMBOLS)
+def test_abi_symbols_are_kept_with_the_flag(category, name, normalised):
+    assert make_symbol_list(f'0000000000001130 {category} {name}', abi_symbols=True) == [normalised]
+    assert make_symbol_list(f'0000000000001130 {category} {name}@@LIB_1.0', abi_symbols=True) == [normalised]
+    assert make_symbol_list(f'                 U {name}', undefined_only=True, abi_symbols=True) == [normalised]
+
+
+@pytest.mark.parametrize(
+    'text,expected',
+    [
+        pytest.param('D vtable for Foo', ['Foo::$vtable'], id='vtable'),
+        pytest.param('D typeinfo for Foo', ['Foo::$typeinfo'], id='typeinfo'),
+        pytest.param('D VTT for Foo', ['Foo::$VTT'], id='vtt'),
+        pytest.param('Foo :: $vtable', ['Foo::$vtable'], id='spaced-dollar-form'),
+        pytest.param('[typeinfo] Foo', ['Foo::$typeinfo'], id='bracketed-form'),
+    ],
+)
+def test_abi_symbols_normalise_to_dollar_names_with_the_flag(text, expected):
+    assert make_symbol_list(text, abi_symbols=True) == expected
+
+
+@pytest.mark.parametrize(
+    'text,expected',
+    [
+        ('T vtable_for_x()', 'vtable_for_x'),
+        ('T typeinfo::name()', 'typeinfo::name'),
+        ('T typeinfo::vtable(int)', 'typeinfo::vtable'),
+        ('B ns::VTT', 'ns::VTT'),
+        ('T ns::guard_variable_for(int)', 'ns::guard_variable_for'),
+        ('T ns::thunk::to(int)', 'ns::thunk::to'),
+        ('u ns::f()::x', 'ns::f()::x'),
+        ('W ns::f()::{lambda(int)#1}::operator()(int) const', 'ns::f()::{lambda(int)#1}::operator()'),
+        ('T _ZGVbN2v_sin@@GLIBC_2.22', '_ZGVbN2v_sin'),
+        ('T typeinfo ns::get<long>()', 'ns::get<long>'),
+        ('W vtable ns::make<int>()', 'ns::make<int>'),
+        ('W VTT ns::table<int>()', 'ns::table<int>'),
+        ('W typeinfo const& ns::ref<int>()', 'ns::ref<int>'),
+        ('W typeinfo name<int>()', 'name<int>'),
+        ('W typeinfo for_each<int>()', 'for_each<int>'),
+    ],
+)
+def test_user_declared_names_that_resemble_abi_symbols_are_kept(text, expected):
+    assert make_symbol_list(text) == [expected]
+    assert make_symbol_list(text, comments=True) == [expected]
+    assert make_symbol_list(expected, comments=True) == [expected]
+
+
+ABI_SYMBOLS_LISTED_BY_V0_2_0 = [
+    'ns::Foo::$vtable',
+    'ns::Foo::$VTT',
+    'ns::Foo::$typeinfo',
+    'ns::Foo::$typeinfo_name',
+    'fn for ns::Foo::$typeinfo',
+    'construction vtable for ns::Foo-in-ns::Foo<int>',
+    'guard variable for ns::f()::{lambda()#1}::operator()() const::x',
+    'TLS init function for ns::x',
+    'TLS wrapper function for ns::x',
+    'thunk to ns::Foo::f',
+    'thunk to ns::Foo::operator()',
+    'thunk to(anonymous namespace)::Foo::f',
+    'return thunk to ns::Foo::clone',
+    'clone for ns::f',
+    'clone for ns::Foo::operator()',
+    'clone for std::bad_exception::what',
+    'thunk to std::strstream::~strstream',
+    'reference temporary #0 for ns::x',
+    '_ZGRN2ns1rE_',
+    'template parameter object for ns::point{3}',
+    'initializer for module foo.bar',
+]
+
+ABI_SYMBOLS_LISTED_BY_V0_1_0 = [
+    'name for ns::Foo::$typeinfo',
+    'name for ns::Foo@::$typeinfo',
+    'fn for ns::Foo@::$typeinfo',
+    'ns::Foo@::$vtable',
+    'ns::Foo@::$VTT',
+    'ns::Foo@@libfoo-1.0.so.0::$typeinfo',
+    'for(anonymous namespace)::Foo::$vtable',
+    'reference temporary',
+    'vtable for ns::f()::{lambda',
+    'variable for ns::f()::{lambda',
+    'init function for ns::v<ns::f()::{lambda',
+    'wrapper function for ns::v<ns::f()::{lambda',
+    'parameter object for ns::wrap<ns::f()::{lambda',
+    'virtual thunk to ns::f()::{unnamed type',
+    'non-virtual thunk to ns::f()::{unnamed type',
+    'covariant return thunk to ns::f()::{unnamed type',
+    'transaction clone for ns::f()::{unnamed type',
+    'virtual thunk to ns::Foo::f()@',
+    'non-virtual thunk to ns::Foo::f()@',
+    'covariant return thunk to ns::Foo::clone() const@',
+    'transaction clone for ns::f(int)@',
+    'transaction clone for std::bad_exception::what() const@',
+    'virtual thunk to std::strstream::~strstream()@',
+    'construction vtable for ns::Foo-in-ns::Foo<int>@',
+    'guard variable for ns::x@',
+    'TLS init function for ns::x@',
+    'TLS wrapper function for ns::x@',
+    'TLS wrapper function for(anonymous namespace)::x',
+    'clone for(anonymous namespace)::Foo::f',
+    'template parameter object for ns::point{3}@',
+    'initializer for module foo.bar@',
+    '_ZGRN2ns1rE_@',
+]
+
+ABI_SYMBOLS_WRITTEN_BY_HAND = [
+    'vtable for ns::Foo',
+    'typeinfo name for ns::Foo',
+    'D vtable for ns::Foo',
+    '[vtable] ns::Foo',
+    'ns::Foo :: $typeinfo',
+    'ns::Foo::$vtable # comment',
+]
+
+
+@pytest.mark.parametrize(
+    'line', ABI_SYMBOLS_LISTED_BY_V0_2_0 + ABI_SYMBOLS_LISTED_BY_V0_1_0 + ABI_SYMBOLS_WRITTEN_BY_HAND
+)
+def test_abi_symbol_lines_in_a_check_file_are_ignored(line):
+    assert make_symbol_list(line, comments=True) == []
+
+
+@pytest.mark.parametrize(
+    'line', ABI_SYMBOLS_LISTED_BY_V0_2_0 + ABI_SYMBOLS_LISTED_BY_V0_1_0 + ABI_SYMBOLS_WRITTEN_BY_HAND
+)
+def test_abi_symbol_lines_in_a_check_file_are_kept_with_the_flag(line):
+    assert make_symbol_list(line, comments=True, abi_symbols=True) != []
+
+
+def test_check_file_keeps_its_other_lines_when_abi_symbols_are_ignored():
+    text = 'foo\nns::Foo::$vtable\nthunk to ns::Foo::f\nns::bar'
+    assert make_symbol_list(text, comments=True) == ['foo', 'ns::bar']
+
+
+@pytest.mark.parametrize(
+    'name',
+    [
+        'Foo::$vtable',
+        'Foo::$VTT',
+        'Foo::$typeinfo',
+        'Foo::$typeinfo_name',
+        'construction vtable for ns::Foo-in-ns::Foo<int>',
+        'guard variable for ns::f()::{lambda()#1}::operator()() const::x',
+        'TLS wrapper function for ns::x',
+        'thunk to ns::Foo::f',
+        'return thunk to ns::Foo::clone',
+        'clone for ns::f',
+        '_ZGRN2ns1rE_',
+    ],
+)
+def test_abi_symbol_names_are_unchanged_when_read_back_with_the_flag(name):
+    assert make_symbol_list(name, comments=True, abi_symbols=True) == [name]
 
 
 @pytest.mark.parametrize(
@@ -217,7 +424,7 @@ def test_symbolic_operators_keep_their_names(text, expected):
     'text', ['typeinfo name for Foo', 'D typeinfo name for Foo', 'Foo :: $typeinfo_name', '[typeinfo_name] Foo']
 )
 def test_typeinfo_name_normalises_to_a_typeinfo_name_suffix(text):
-    assert make_symbol_list(text) == ['Foo::$typeinfo_name']
+    assert make_symbol_list(text, abi_symbols=True) == ['Foo::$typeinfo_name']
 
 
 def test_lambda_names_in_nm_output_are_not_cut_at_the_hash():
@@ -235,6 +442,13 @@ def test_comment_markers_in_nm_output_are_kept(monkeypatch):
     stdout = f'0000000000001139 T {name}\n'
     monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ''))
     assert run_nm(Path('libfake.so')) == [name]
+
+
+def test_run_nm_drops_abi_symbols_unless_asked(monkeypatch):
+    stdout = '0000000000004d80 V vtable for Foo\n0000000000001139 T foo()\n'
+    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ''))
+    assert run_nm(Path('libfake.so')) == ['foo']
+    assert run_nm(Path('libfake.so'), abi_symbols=True) == ['Foo::$vtable', 'foo']
 
 
 def test_check_file_comments_are_removed():
@@ -272,8 +486,6 @@ def test_unbalanced_parentheses_are_kept_without_crashing(text, expected):
         'ns::Foo::bar',
         'ns::tmpl<int>',
         'std::string::size',
-        'Foo::$vtable',
-        'Foo::$typeinfo_name',
         'operator new',
         'operator delete[]',
         'Foo::operator bool',

@@ -24,7 +24,7 @@ pip3 install check-symbols
 
 ```
 usage: check-symbols [-h] [--version] [--check <path>] [--diff <path>] [--include <regex> [<regex> ...]]
-                     [--exclude <regex> [<regex> ...]]
+                     [--exclude <regex> [<regex> ...]] [--abi-symbols]
                      [<path>]
 
 Command-line utility for checking ELF symbols.
@@ -42,8 +42,9 @@ options:
                         one or more regular expressions to select the listed/checked symbols.
   --exclude <regex> [<regex> ...]
                         one or more regular expressions to exclude from the listed/checked symbols.
+  --abi-symbols         include compiler-generated ABI symbols such as vtables, typeinfo, thunks and guard variables
 
-v0.1.0 - github.com/marzer/check-symbols
+v0.2.0 - github.com/marzer/check-symbols
 ```
 
 With neither --check nor --diff, the exported symbols are printed one per line. This output is valid input for
@@ -70,12 +71,20 @@ the `#` in `{lambda(int)#1}` or the `;` in `[u8; 16]`, does not start a comment.
 Lines in a check file are normalised in the same way as the library's symbols, so `ns::foo(int) const` matches
 `ns::foo`.
 
+Without --abi-symbols, lines for compiler-generated ABI symbols are ignored and never reported as missing. This
+includes the forms that earlier versions printed, such as `X::$vtable`. To check these symbols, use --abi-symbols.
+
 ### Normalisation
 
 Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, and are then normalised:
 
--   Only symbols of type B, D and T (uninitialised data, initialised data and code) are kept. Linker-generated
-    symbols such as `_edata` and `__bss_start` are dropped.
+-   A library exports the symbols of type B and D (data), R (read-only data), T (code), V and W (weak definitions),
+    u (unique globals) and i (indirect functions). Types are matched case-sensitively. U, v and w are imports, and
+    only U counts on the consumer side of --diff. A, the version definitions, is dropped, as are linker-generated
+    symbols such as `_edata` and `__bss_start`.
+-   Compiler-generated ABI symbols are dropped: vtables, VTTs, typeinfo, thunks, guard variables, TLS init and
+    wrapper functions, transaction clones, reference temporaries, template parameter objects and module
+    initialisers. Where these appear depends on LTO and the toolchain. --abi-symbols keeps them.
 -   Version tags are removed: `adler32@@ZLIB_1.2.0` becomes `adler32`.
 -   Parameter lists and cv- and ref-qualifiers are removed, so all overloads of a function share one name:
     `ns::vec::get(int) const` becomes `ns::vec::get`.
@@ -88,8 +97,8 @@ Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, a
     `ns::foo()::{lambda(int)#1}::operator()`.
 -   Common standard library types are shortened, and the `[abi:cxx11]` tag is removed (other ABI tags are kept):
     `std::basic_string<char, std::char_traits<char>, std::allocator<char> >` becomes `std::string`.
--   vtables, typeinfo objects, typeinfo names and VTTs become `X::$vtable`, `X::$typeinfo`, `X::$typeinfo_name` and
-    `X::$VTT`.
+-   With --abi-symbols, vtables, typeinfo objects, typeinfo names and VTTs become `X::$vtable`, `X::$typeinfo`,
+    `X::$typeinfo_name` and `X::$VTT`.
 -   The list is sorted, and duplicates are removed.
 
 ### Exit codes
