@@ -1,0 +1,5 @@
+FIXTURE_1.0
+{
+	global:
+		versioned_answer;
+};

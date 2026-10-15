@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-# This file is a part of marzer/check-symbols and is subject to the the terms of the MIT license.
+# This file is a part of marzer/check-symbols and is subject to the terms of the MIT license.
 # Copyright (c) Mark Gillard <mark.gillard@outlook.com.au>
 # See https://github.com/marzer/check-symbols/blob/main/LICENSE.txt for the full license text.
 # SPDX-License-Identifier: MIT
 
 import argparse
 import re
-import os
 import subprocess
 import sys
-import misk
+import typing
 from io import StringIO
 from pathlib import Path
 
 import colorama
+import misk
 
 from . import paths
 from .colour import *
 from .version import *
+
+
+class Error(Exception):
+    pass
 
 
 def error(text):
@@ -47,8 +51,64 @@ for prefix, type in (('', 'char'), ('w', 'wchar_t')):
         (re.compile(rf'std::basic_((?:if|of|f)?stream|(?:file|stream)buf|ios)<\s*{type}\s*>'), rf'std::{prefix}\1')
     )
 
+OPERATOR = re.compile(r'\boperator\b')
+NESTED = r'(?:[^()]|\([^()]*\))*'
+POINTER_DECLARATOR = re.compile(rf'\((?:{NESTED}::)?[*&]{NESTED}\)$')
 
-def make_symbol_list(s, undefined_only=False):
+
+def remove_comment(line: str) -> str:
+    depth = 0
+    for pos, c in enumerate(line):
+        if c in '{[(':
+            depth += 1
+        elif c in '}])':
+            depth = max(depth - 1, 0)
+        elif depth == 0 and (c in '#;' or line.startswith('//', pos)):
+            return line[:pos]
+    return line
+
+
+def strip_return_type(name: str) -> str:
+    depth = 0
+    for pos, c in enumerate(name):
+        if c in '([{<':
+            depth += 1
+        elif c in ')]}>':
+            depth -= 1
+        elif depth != 0:
+            continue
+        elif c in ' \t':
+            name = name[pos:].strip()
+            return re_sub_all(r'^\s*(?:const|volatile|const\s+volatile|volatile\s+const)\s*&\s+(.+?)\s*$', r'\1', name)
+        elif OPERATOR.match(name, pos):
+            return name
+    return name
+
+
+def strip_signature(name: str) -> str:
+    # find parameter list
+    # (regex alone is not enough here - a parens-balancing reverse parse is required)
+    m = re.search(r'\)(?:\s*(?:const|volatile|noexcept|&&?))*$', name)
+    if not m:
+        return name
+    depth = 0
+    for pos in range(m.start(), -1, -1):
+        if name[pos] == ')':
+            depth += 1
+        elif name[pos] == '(':
+            depth -= 1
+            if depth != 0:
+                continue
+            head = name[:pos].rstrip()
+            if re.search(r'\boperator$', head):
+                return strip_return_type(name[: m.start() + 1])
+            if OPERATOR.search(head) and POINTER_DECLARATOR.search(head):
+                return name
+            return strip_return_type(head)
+    return name
+
+
+def make_symbol_list(s, undefined_only=False, comments=False) -> list[str]:
     # remove c++11 abi tags
     s = str(s).replace('[abi:cxx11]', '').replace('std::__cxx11::', 'std::').strip()
     # demangle std templated symbol names with their aliases
@@ -59,93 +119,37 @@ def make_symbol_list(s, undefined_only=False):
     # split and trim per-line
     s = [i.strip() for i in re.split(r'[\r\n]', s)]
     # remove comments
-    s = [re.sub(r'^(.*?)(?:[#;]|//).*$', r'\1', i) for i in s]
+    if comments:
+        s = [remove_comment(i) for i in s]
     # remove any categorized symbols we don't want (https://linux.die.net/man/1/nm)
     allowed_categories = (r'U',) if undefined_only else (r'B', r'D', r'T')
     s2 = []
     for i in s:
         m = re.match(r'^(?:[0-9a-fA-F]{6,32}\s+)?([a-zA-Z])\s+(.+?)$', i)
         if m:
-            if not m[1].upper() in allowed_categories:
+            if m[1].upper() not in allowed_categories:
                 continue
             i = m[2].strip()
         s2.append(i)
     s = s2
     # normalize spacing and weird oddities
-    s = [re_sub_all(r'^(.+?)@\s*[a-zA-Z][a-zA-Z0-9._]*\s*$', r'\1', i) for i in s]  # @IMPORT tags
+    s = [re_sub_all(r'^(.+?)@@?\s*[a-zA-Z][a-zA-Z0-9._+~-]*\s*$', r'\1', i) for i in s]  # @IMPORT tags
     s = [re_sub_all(r'>\s+>', '>>', i) for i in s]
     s = [re_sub_all(r',\s\s+([a-zA-Z0-9_])', r', \1', i) for i in s]
     s = [re_sub_all(r'([a-zA-Z0-9_>])\s+\(', r'\1(', i) for i in s]
     # normalize vtable and type info representations
-    s = [re.sub(r'^\s*(.+?)\s*::\s*\$\s*(vtable|typeinfo|VTT)\s*$', r'\1::$\2', i).strip() for i in s]
-    s = [re.sub(r'^\s*\[\s*(vtable|typeinfo|VTT)\s*\]\s*(.+?)$', r'\2::$\1', i).strip() for i in s]
+    s = [re.sub(r'^\s*(.+?)\s*::\s*\$\s*(vtable|typeinfo_name|typeinfo|VTT)\s*$', r'\1::$\2', i).strip() for i in s]
+    s = [re.sub(r'^\s*\[\s*(vtable|typeinfo_name|typeinfo|VTT)\s*\]\s*(.+?)$', r'\2::$\1', i).strip() for i in s]
+    s = [re.sub(r'^\s*typeinfo\s+name\s+(?:for\s+)?(.+?)$', r'\1::$typeinfo_name', i).strip() for i in s]
     s = [re.sub(r'^\s*(vtable|typeinfo|VTT)\s+(?:for\s+)?(.+?)$', r'\2::$\1', i).strip() for i in s]
     # special handling for functions
-    s2 = []
-    for i in s:
-        # find parameter list
-        # (regex alone is not enough here - a parens-balancing reverse parse is required)
-        m = re.search(r'\)(?:\s*(?:const|volatile|noexcept|&&?))*$', i)
-        if m:
-            parens = -1
-            for pos in range(m.start() - 1, -1, -1):
-                if i[pos] == '(':
-                    parens += 1
-                elif i[pos] == ')':
-                    parens -= 1
-                if parens == 0:
-                    break
-            # we found a parameter list, so chop it off
-            if pos >= 0 and parens == 0 and i[pos] == '(':
-                i = i[:pos].strip()
-                # now lets see if we have a return type
-                # again we need to do a bracket-balancing parse
-                parens = 0  # ()
-                square = 0  # []
-                curly = 0  # {}
-                angle = 0  # <>
-                for pos in range(len(i)):
-                    if i[pos] == '(':
-                        parens += 1
-                    elif i[pos] == ')':
-                        parens -= 1
-                    elif i[pos] == '[':
-                        square += 1
-                    elif i[pos] == ']':
-                        square -= 1
-                    elif i[pos] == '{':
-                        curly += 1
-                    elif i[pos] == '}':
-                        curly -= 1
-                    elif i[pos] == '<':
-                        angle += 1
-                    elif i[pos] == '>':
-                        angle -= 1
-                    elif i[pos] in (' ', '\t') and parens == 0 and square == 0 and curly == 0 and angle == 0:
-                        i = i[pos:].strip()
-                        break
-
-                i = re_sub_all(r'^\s*(?:const|volatile|const\s+volatile|volatile\s+const)\s*&\s+(.+?)\s*$', r'\1', i)
-
-        s2.append(i)
-    s = s2
+    s = [strip_signature(i) for i in s]
     # remove blank lines
     s = [i for i in [j.strip() for j in s] if i]
     # remove more implementation details
     s = [i for i in s if not re.fullmatch(r'(?:__bss_start|_edata|_end|_fini|_init)', i)]
     # de-duplicate and sort
-    s = sorted(misk.remove_duplicates(s))
-    return s
-
-
-def get_relative_path(p: Path, relative_to: Path = Path.cwd()) -> Path:
-
-    p = misk.coerce_path(p).resolve()
-    relative_to = misk.coerce_path(relative_to).resolve()
-    try:
-        return Path(os.path.relpath(str(p), str(relative_to)))
-    except:
-        return p
+    return sorted(set(s))
 
 
 def matches_all(s: str, pattern) -> bool:
@@ -164,221 +168,212 @@ def matches_any(s: str, pattern) -> bool:
     return False
 
 
-def main_impl():
-    args = argparse.ArgumentParser(
-        description=r"Exported symbol helper tool for shared library projects",
+def filter_symbols(symbols: list[str], include, exclude) -> list[str]:
+    return [s for s in symbols if matches_all(s, include) and not matches_any(s, exclude)]
+
+
+def diff_symbols(exported: list[str], imported: list[str]) -> tuple[list[str], list[str], list[str]]:
+    exported_set = set(exported)
+    imported_set = set(imported)
+    used = [s for s in exported if s in imported_set]
+    unused = [s for s in exported if s not in imported_set]
+    missing = [s for s in imported if s not in exported_set]
+    return used, unused, missing
+
+
+def check_symbols(exported: list[str], expected: list[str]) -> tuple[list[str], list[str]]:
+    exported_set = set(exported)
+    expected_set = set(expected)
+    missing = [s for s in expected if s not in exported_set]
+    unexpected = [s for s in exported if s not in expected_set]
+    return missing, unexpected
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=r"Command-line utility for checking ELF symbols.",
         epilog=rf'v{VERSION_STRING} - github.com/marzer/check-symbols',
     )
-    args.add_argument(r'--version', action=r'store_true', help=r"print the version and exit", dest=r'print_version')
-    args.add_argument(r'--where', action=r'store_true', help=argparse.SUPPRESS)
-    args.add_argument(
+    parser.add_argument(r'--version', action=r'store_true', help=r"print the version and exit", dest=r'print_version')
+    parser.add_argument(r'--where', action=r'store_true', help=argparse.SUPPRESS)
+    parser.add_argument(
         r"lib",
         type=Path,
         nargs=r'?',
         default=None,
         metavar=r"<path>",
         help="path to the shared library, or a directory containing it (default: discover automatically)",
-    ),
-    args.add_argument(
+    )
+    parser.add_argument(
         r"--check",
         type=Path,
         default=None,
         metavar=r"<path>",
         help='path to a text file containing a list of expected symbols (one per line). use a dash (\'-\') to read from stdin.',
     )
-    args.add_argument(
+    parser.add_argument(
         r"--diff",
         type=Path,
         default=None,
         metavar=r"<path>",
         help=rf"compiled executable or shared library expected to consume the symbols",
     )
-    args.add_argument(
+    parser.add_argument(
         r"--include",
         type=str,
         nargs='+',
         metavar=r"<regex>",
         help=rf"one or more regular expressions to select the listed/checked symbols.",
     )
-    args.add_argument(
+    parser.add_argument(
         r"--exclude",
         type=str,
         nargs='+',
         metavar=r"<regex>",
         help=rf"one or more regular expressions to exclude from the listed/checked symbols.",
     )
-    args = args.parse_args()
+    return parser.parse_args(argv)
+
+
+def find_library(path: typing.Optional[Path]) -> Path:
+    if path is None:
+        path = Path.cwd()
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise Error(rf"shared library {bright(path)} did not exist or was not a file")
+    for item in sorted(path.iterdir()):
+        if item.name.endswith('.so') and item.is_file():
+            return item
+    raise Error(rf"could not find a shared library in {bright(path)}")
+
+
+def compile_patterns(patterns: typing.Optional[list[str]]) -> list[re.Pattern]:
+    try:
+        return [re.compile(p) for p in patterns or []]
+    except re.error as err:
+        raise Error(rf"invalid regular expression {bright(err.pattern)}: {err}") from None
+
+
+def run_nm(path: Path, undefined_only=False) -> list[str]:
+    try:
+        result = subprocess.run([r'nm', r'-PBDCg', str(path)], capture_output=True, encoding='utf-8')
+    except FileNotFoundError:
+        raise Error(rf"{bright('nm')} was not found on the PATH") from None
+    if result.returncode == 0:
+        return make_symbol_list(result.stdout, undefined_only=undefined_only)
+    outputs = ''
+    for name, text in (('stdout', result.stdout), ('stderr', result.stderr)):
+        if text:
+            outputs += f'\n  {bright(name)}:\n'
+            outputs += "\n".join([rf'    {i.strip()}' for i in text.split('\n') if i.strip()])
+    raise Error(rf"{bright('nm')} exited with code {bright(result.returncode)}{outputs}")
+
+
+def read_check_file(path: Path) -> str:
+    if path == Path('-'):
+        return sys.stdin.read()
+    if not path.is_file():
+        raise Error(rf"expected symbol list {bright(path)} did not exist or was not a file")
+    return path.read_text(encoding='utf-8')
+
+
+def print_diff(lib: Path, consumer: Path, used: list[str], unused: list[str], missing: list[str]):
+    print(rf'diffing symbols exported by {bright(lib)} against those imported by {bright(consumer)}:')
+    batches = (
+        (used, rf'exported symbols {bright("imported", "GREEN")} by {bright(consumer)}:', bright("OK", 'GREEN')),
+        (unused, rf'exported symbols {bright("unused", "YELLOW")} by {bright(consumer)}:', bright("--", 'YELLOW')),
+        (missing, rf'imported symbols {bright("not exported", "RED")} by {bright(lib)}:', bright("??", 'RED')),
+    )
+    for symbols, header, prefix in batches:
+        if not symbols:
+            continue
+        print(header)
+        for symbol in symbols:
+            print(rf'[{prefix}] {symbol}')
+    summary = r'exported '
+    summary += bright(rf'{len(used)} / {len(used) + len(missing)}', 'GREEN' if not missing else 'RED')
+    summary += rf' expected symbols'
+    if unused:
+        summary += rf', with {bright(len(unused), "YELLOW")} unused'
+    summary += rf' ({len(used) + len(unused)} total).'
+    print(summary)
+
+
+def print_check(lib: Path, list_path: Path, expected: list[str], missing: list[str], unexpected: list[str]):
+    print(rf'checking symbols {bright(lib)} with those listed in {bright(list_path)}:')
+    missing_set = set(missing)
+    for symbol in expected:
+        if symbol in missing_set:
+            print(rf'[{bright("??", "RED")}] {symbol} - {bright("not found", "RED")}')
+        else:
+            print(rf'[{bright("OK", "GREEN")}] {symbol}')
+    if unexpected:
+        print(rf'exported symbols that were {bright("NOT", "RED")} on the list:')
+    for symbol in unexpected:
+        print(rf'[{bright("XX", "RED")}] {symbol}')
+    summary = r'found '
+    summary += bright(rf'{len(expected) - len(missing)} / {len(expected)}', 'GREEN' if not missing else 'RED')
+    summary += rf' expected symbols'
+    if unexpected:
+        summary += rf' and {bright(len(unexpected), "RED")} unexpected ones'
+    summary += rf'.'
+    print(summary)
+
+
+def main_impl(argv=None) -> int:
+    args = parse_args(argv)
 
     if args.print_version:
         print(VERSION_STRING)
-        return
+        return 0
 
     if args.where:
         print(paths.PACKAGE)
-        return
-
-    # find lib
-    if args.lib is None:
-        args.lib = Path.cwd()
-    if args.lib.is_dir():
-        dir = args.lib
-        args.lib = None
-        for item in dir.iterdir():
-            if item.name.endswith('.so') and item.is_file():
-                args.lib = item
-                break
-        if args.lib is None:
-            return rf"could not find a shared library in {bright(dir)}"
-    else:
-        if not args.lib.is_file():
-            return rf"shared library {bright(args.lib)} did not exist or was not a file"
-
-    # compute patterns
-    if not args.include:
-        args.include = []
-    if not args.exclude:
-        args.exclude = []
-    args.include = [re.compile(s) for s in args.include]
-    args.exclude = [re.compile(s) for s in args.exclude]
-
-    def get_filtered_symbols_from_binary(bin_path, undefined_only=False):
-        nonlocal args
-        symbols = subprocess.run(
-            [r'nm', r'-PBDCg', str(bin_path)], capture_output=True, cwd=str(Path.cwd()), encoding='utf-8'
-        )
-        if symbols.returncode != 0:
-            outputs = ''
-            if symbols.stdout:
-                outputs += f'\n  {bright("stdout")}:\n'
-                outputs += "\n".join([rf'    {i.strip()}' for i in symbols.stdout.split('\n') if i.strip()])
-            if symbols.stderr:
-                outputs += f'\n  {bright("stderr")}:\n'
-                outputs += "\n".join([rf'    {i.strip()}' for i in symbols.stderr.split('\n') if i.strip()])
-            return (False, rf"{bright('nm')} exited with code {bright(symbols.returncode)}{outputs}")
-        symbols = make_symbol_list(symbols.stdout, undefined_only=undefined_only)
-        symbols = [s for s in symbols if matches_all(s, args.include)]
-        symbols = [s for s in symbols if not matches_any(s, args.exclude)]
-        symbols = sorted(misk.remove_duplicates(symbols))
-        return (True, symbols)
-
-    # get symbols from target lib
-    symbols = get_filtered_symbols_from_binary(args.lib)
-    if not symbols[0]:
-        return symbols[1]  # error message
-    symbols = symbols[1]
-
-    # just list the symbols and exit if not in 'diff' or 'check' mode
-    if args.diff is None and args.check is None:
-        for s in symbols:
-            print(s)
         return 0
 
-    retval = 0
+    lib = find_library(args.lib)
+    include = compile_patterns(args.include)
+    exclude = compile_patterns(args.exclude)
+    exported = filter_symbols(run_nm(lib), include, exclude)
 
-    # diff against binary
+    if args.diff is None and args.check is None:
+        for symbol in exported:
+            print(symbol)
+        return 0
+
+    result = 0
+
     if args.diff is not None:
-        if not (args.diff.exists() and args.diff.is_file()):
-            return rf"expected binary {bright(args.diff)} did not exist or was not a file"
-        exe_symbols = get_filtered_symbols_from_binary(args.diff, undefined_only=True)
-        if not exe_symbols[0]:
-            return exe_symbols[1]  # error message
-        exe_symbols = exe_symbols[1]
-        print(rf'diffing symbols exported by {bright(args.lib)} against those imported by {bright(args.diff)}:')
-        unused = []
-        used = []
-        missing = []
-        for symbol in symbols:
-            (used if symbol in exe_symbols else unused).append(symbol)
-        for symbol in exe_symbols:
-            if symbol not in used:
-                missing.append(symbol)
-        batches = (
-            (used, rf'exported symbols {bright("imported", "GREEN")} by {bright(args.diff)}:', bright("OK", 'GREEN')),
-            (unused, rf'exported symbols {bright("unused", "YELLOW")} by {bright(args.diff)}:', bright("--", 'YELLOW')),
-            (missing, rf'imported symbols {bright("not exported", "RED")} by {bright(args.lib)}:', bright("??", 'RED')),
-        )
-        for result, header, prefix in batches:
-            if result:
-                print(header)
-                for symbol in result:
-                    print(rf'[{prefix}] {symbol}')
-        summary = r'exported '
-        summary += bright(rf'{len(used)} / {len(used) + len(missing)}', 'GREEN' if not missing else 'RED')
-        summary += rf' expected symbols'
-        if len(unused):
-            summary += rf', with {bright(len(unused), "YELLOW")} unused'
-        summary += rf' ({len(symbols)} total).'
-        print(summary)
+        if not args.diff.is_file():
+            raise Error(rf"expected binary {bright(args.diff)} did not exist or was not a file")
+        imported = filter_symbols(run_nm(args.diff, undefined_only=True), include, exclude)
+        used, unused, missing = diff_symbols(exported, imported)
+        print_diff(lib, args.diff, used, unused, missing)
         if missing:
-            retval = retval or 1
+            result |= 1
 
-    # check against list file
     if args.check is not None:
-        check_text = ''
-        if args.check == Path('-'):
-            for line in sys.stdin:
-                check_text += f'{line.rstrip()}\n'
-        else:
-            if not (args.check.exists() and args.check.is_file()):
-                return rf"expected symbol list {bright(args.check)} did not exist or was not a file"
-            check_text = misk.read_all_text_from_file(args.check)
-        expected_symbols = make_symbol_list(check_text)
-        expected_symbols = [s for s in expected_symbols if matches_all(s, args.include)]
-        expected_symbols = [s for s in expected_symbols if not matches_any(s, args.exclude)]
-        if not expected_symbols:
-            return rf"expected symbol list {bright(args.check)} was empty"
-        print(rf'checking symbols {bright(args.lib)} with those listed in {bright(args.check)}:')
-        found_count = 0
-        for symbol in expected_symbols:
-            if symbol in symbols:
-                print(rf'[{bright("OK", "GREEN")}] {symbol}')
-                found_count += 1
-            else:
-                print(rf'[{bright("??", "RED")}] {symbol} - {bright("not found", "RED")}')
-        unexpected_count = 0
-        for symbol in symbols:
-            if symbol not in expected_symbols:
-                if unexpected_count == 0:
-                    print(rf'exported symbols that were {bright("NOT", "RED")} on the list:')
-                print(rf'[{bright("XX", "RED")}] {symbol}')
-                unexpected_count += 1
+        expected = filter_symbols(make_symbol_list(read_check_file(args.check), comments=True), include, exclude)
+        if not expected:
+            raise Error(rf"expected symbol list {bright(args.check)} was empty")
+        missing, unexpected = check_symbols(exported, expected)
+        print_check(lib, args.check, expected, missing, unexpected)
+        if missing:
+            result |= 1
+        if unexpected:
+            result |= 2
 
-        summary = r'found '
-        summary += bright(
-            rf'{found_count} / {len(expected_symbols)}', 'GREEN' if (found_count == len(expected_symbols)) else 'RED'
-        )
-        summary += rf' expected symbols'
-        if unexpected_count:
-            summary += rf' and {bright(unexpected_count, "RED")} unexpected ones'
-        summary += rf'.'
-        print(summary)
-
-        if found_count != len(expected_symbols):
-            retval = retval | 1
-        if unexpected_count:
-            retval = retval | 2
-
-    return retval
+    return result
 
 
-def main():
+def main(argv=None):
     colorama.init()
-    result = None
     try:
-        result = main_impl()
-        if result is None:
-            sys.exit(0)
-        elif isinstance(result, int):
-            sys.exit(result)
-        elif isinstance(result, str):  # error message
-            error(result)
-            sys.exit(-1)
-        else:
-            error('unexpected result type')
-            sys.exit(-1)
+        sys.exit(main_impl(argv))
     except SystemExit as exit:
         raise exit from None
-    except argparse.ArgumentError as err:
+    except (Error, argparse.ArgumentError) as err:
         error(err)
         sys.exit(-1)
     except BaseException as err:
