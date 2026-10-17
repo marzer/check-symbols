@@ -66,6 +66,7 @@ NORMALISED_ABI_SYMBOL = re.compile(
     r'.+::\$(?:vtable|VTT|typeinfo|typeinfo_name)|reference temporary'
     r'|(?:(?:return )?thunk to|(?:variable|clone|init function|wrapper function|parameter object) for)[ (].+'
 )
+LOCAL_ENTITY = re.compile(r'(?<!\(anonymous namespace)\)(?: const| volatile| &&?)*::')
 
 
 def remove_comment(line: str) -> str:
@@ -166,6 +167,11 @@ def make_symbol_list(s, undefined_only=False, comments=False, abi_symbols=False)
         s = [i for i in s if not NORMALISED_ABI_SYMBOL.fullmatch(i)]
     # special handling for functions
     s = [strip_signature(i) for i in s]
+    # local entities are only ever global with vague linkage, which gcc's lto can turn into a strong definition
+    if abi_symbols:
+        s = [i for i in s if not LOCAL_ENTITY.search(i) or ABI_SYMBOL.match(i) or NORMALISED_ABI_SYMBOL.fullmatch(i)]
+    else:
+        s = [i for i in s if not LOCAL_ENTITY.search(i)]
     # remove blank lines
     s = [i for i in [j.strip() for j in s] if i]
     # remove more implementation details

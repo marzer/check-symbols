@@ -74,6 +74,9 @@ Lines in a check file are normalised in the same way as the library's symbols, s
 Without --abi-symbols, lines for compiler-generated ABI symbols are ignored and never reported as missing. This
 includes the forms that earlier versions printed, such as `X::$vtable`. To check these symbols, use --abi-symbols.
 
+Lines for function-local entities, such as `ns::foo()::x` and `ns::foo()::{lambda(int)#1}::operator()`, are ignored
+too, with or without --abi-symbols. Earlier versions listed them.
+
 ### Normalisation
 
 Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, and are then normalised:
@@ -86,6 +89,11 @@ Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, a
 -   Compiler-generated ABI symbols are dropped: vtables, VTTs, typeinfo, thunks, guard variables, TLS init and
     wrapper functions, transaction clones, reference temporaries, template parameter objects and module
     initialisers. Where these appear depends on LTO and the toolchain. --abi-symbols keeps them, weak or not.
+-   Function-local entities are dropped: local statics, the members of local classes and lambdas, and templates
+    instantiated with them, such as `ns::foo()::x` and `ns::foo()::{lambda(int)#1}::operator()`. They cannot be named
+    outside the function, and are only exported when the function is inline or a template, as weak or unique
+    definitions that GCC's LTO makes strong. --abi-symbols keeps their ABI symbols, such as
+    `guard variable for ns::foo()::x`.
 -   Version tags are removed: `adler32@@ZLIB_1.2.0` becomes `adler32`.
 -   Parameter lists and cv- and ref-qualifiers are removed, so all overloads of a function share one name:
     `ns::vec::get(int) const` becomes `ns::vec::get`.
@@ -94,13 +102,17 @@ Symbols are read with `nm -PBDCg`, which prints the demangled dynamic symbols, a
     becomes `int ns::vec::size<int>`.
 -   Operators keep their names: `ns::vec::operator new`, `ns::vec::operator()`, `ns::operator<<`. Conversion
     operators keep their target type: `ns::vec::operator bool`.
--   Lambdas and other local entities keep the name and parameter list of the enclosing function:
-    `ns::foo()::{lambda(int)#1}::operator()`.
 -   Common standard library types are shortened, and the `[abi:cxx11]` tag is removed (other ABI tags are kept):
     `std::basic_string<char, std::char_traits<char>, std::allocator<char> >` becomes `std::string`.
 -   With --abi-symbols, vtables, typeinfo objects, typeinfo names and VTTs become `X::$vtable`, `X::$typeinfo`,
     `X::$typeinfo_name` and `X::$VTT`.
 -   The list is sorted, and duplicates are removed.
+
+GCC's LTO also makes some other weak and unique definitions strong, so a library built with it can export more
+symbols than the same library built without it. These include inline variables, static data members of class
+templates, explicit instantiations, inline functions whose address is taken, and libstdc++ internals such as
+`std::_Function_handler<int(int), int(*)(int)>::_M_invoke`. Make check files from a build with the same LTO setting,
+or narrow the check with --exclude, for example `--exclude '^std::'`.
 
 ### Exit codes
 

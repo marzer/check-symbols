@@ -223,8 +223,6 @@ def test_abi_symbols_normalise_to_dollar_names_with_the_flag(text, expected):
         ('B ns::VTT', 'ns::VTT'),
         ('T ns::guard_variable_for(int)', 'ns::guard_variable_for'),
         ('T ns::thunk::to(int)', 'ns::thunk::to'),
-        ('B ns::f()::x', 'ns::f()::x'),
-        ('T ns::f()::{lambda(int)#1}::operator()(int) const', 'ns::f()::{lambda(int)#1}::operator()'),
         ('T _ZGVbN2v_sin@@GLIBC_2.22', '_ZGVbN2v_sin'),
         ('T typeinfo ns::get<long>()', 'ns::get<long>'),
         ('T vtable ns::make<int>()', 'ns::make<int>'),
@@ -435,13 +433,49 @@ def test_typeinfo_name_normalises_to_a_typeinfo_name_suffix(text):
 
 
 def test_lambda_names_in_nm_output_are_not_cut_at_the_hash():
-    text = '0000000000001139 T foo()::{lambda(int)#1}::operator()(int) const'
-    assert make_symbol_list(text) == ['foo()::{lambda(int)#1}::operator()']
+    text = '0000000000001139 T ns::v::{lambda(int)#1}::operator()(int) const'
+    assert make_symbol_list(text) == ['ns::v::{lambda(int)#1}::operator()']
 
 
-def test_local_entities_keep_the_enclosing_function_parameter_list():
-    text = '0000000000001139 T ns::f(int)::{lambda(void const*)#1}::_FUN(void const*)'
-    assert make_symbol_list(text) == ['ns::f(int)::{lambda(void const*)#1}::_FUN']
+LOCAL_ENTITIES = [
+    pytest.param('R', 'std::_Sp_make_shared_tag::_S_ti()::__tag', id='make-shared-tag'),
+    pytest.param('B', 'ns::f()::x', id='local-static'),
+    pytest.param('B', 'ns::Foo::get() const::x', id='local-static-in-const-member'),
+    pytest.param('B', 'ns::Foo::get() &&::x', id='local-static-in-rvalue-member'),
+    pytest.param('B', 'ns::f<int>()::x', id='local-static-in-template'),
+    pytest.param('B', 'ns::f()::{lambda()#1}::operator()() const::x', id='local-static-in-lambda'),
+    pytest.param('T', 'ns::f()::{lambda(int)#1}::operator()(int) const', id='lambda'),
+    pytest.param('T', 'ns::f(int)::{lambda(void const*)#1}::_FUN(void const*)', id='lambda-static-invoker'),
+    pytest.param('T', 'ns::f()::local::g() const', id='local-class-member'),
+    pytest.param(
+        'T',
+        'std::_Function_handler<void (), ns::f()::{lambda()#1}>::_M_invoke(std::_Any_data const&)',
+        id='template-of-local-type',
+    ),
+]
+
+
+@pytest.mark.parametrize('category,name', LOCAL_ENTITIES)
+def test_local_entities_are_dropped(category, name):
+    assert make_symbol_list(f'0000000000001130 {category} {name}') == []
+    assert make_symbol_list(f'0000000000001130 {category} {name}', abi_symbols=True) == []
+    assert make_symbol_list(f'                 U {name}', undefined_only=True) == []
+    assert make_symbol_list(name, comments=True) == []
+
+
+@pytest.mark.parametrize(
+    'line',
+    [
+        'std::_Sp_make_shared_tag::_S_ti()::__tag',
+        'ns::f()::x',
+        'ns::f()::{lambda(int)#1}::operator()',
+        'ns::f(int)::{lambda(void const*)#1}::_FUN',
+        'foo()::{lambda(int)#1}::operator void(*)(int)',
+    ],
+)
+def test_local_entity_lines_listed_by_v0_3_1_are_ignored(line):
+    assert make_symbol_list(line, comments=True) == []
+    assert make_symbol_list(line, comments=True, abi_symbols=True) == []
 
 
 def test_comment_markers_in_nm_output_are_kept(monkeypatch):
@@ -464,15 +498,15 @@ def test_check_file_comments_are_removed():
 
 
 def test_check_file_comment_markers_inside_braces_are_kept():
-    text = 'foo()::{lambda(int)#1}::operator() # c\nns::f()::{unnamed type#1}::g'
-    expected = ['foo()::{lambda(int)#1}::operator()', 'ns::f()::{unnamed type#1}::g']
+    text = 'ns::v::{lambda(int)#1}::operator() # c\nns::Foo::{unnamed type#1}::g'
+    expected = ['ns::Foo::{unnamed type#1}::g', 'ns::v::{lambda(int)#1}::operator()']
     assert make_symbol_list(text, comments=True) == expected
 
 
 def test_check_file_comment_markers_inside_square_brackets_and_parentheses_are_kept():
     name = '<std::net::ip_addr::Ipv6Addr as core::convert::From<[u8; 16]>>::from'
     assert make_symbol_list(f'{name} # c', comments=True) == [name]
-    assert make_symbol_list('ns::f(char#)::g ; c', comments=True) == ['ns::f(char#)::g']
+    assert make_symbol_list('ns::f<void(char#)> ; c', comments=True) == ['ns::f<void(char#)>']
 
 
 def test_check_file_comments_after_a_stray_closing_bracket_are_removed():
@@ -504,13 +538,14 @@ def test_unbalanced_parentheses_are_kept_without_crashing(text, expected):
         'Foo::operator void(*(*)(int))(char)',
         'Foo::operator void(Foo::*)() const',
         'std::__exception_ptr::exception_ptr::operator void(std::__exception_ptr::exception_ptr::*)()',
-        'foo()::{lambda(int)#1}::operator void(*)(int)',
+        'ns::v::{lambda(int)#1}::operator void(*)(int)',
         'ns::Foo::operator()',
         'ns::Foo::operator()<int>',
         'ns::operator<<',
         'ns::operator==<int>',
-        'foo()::{lambda(int)#1}::operator()',
-        'ns::f(int)::{lambda(void const*)#1}::_FUN',
+        'ns::v::{lambda(int)#1}::operator()',
+        'ns::v::{lambda(void const*)#1}::_FUN',
+        '(anonymous namespace)::Foo::f',
         '<std::net::ip_addr::Ipv6Addr as core::convert::From<[u8; 16]>>::from',
     ],
 )

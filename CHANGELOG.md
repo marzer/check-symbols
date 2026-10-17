@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.2 - 2026-10-18
+
+- fixed GCC's LTO causing function-local entities to leak into the symbol list
+
 ## v0.3.1 - 2026-10-15
 
 - fixed weak and unique definition (V, W and u) regression
